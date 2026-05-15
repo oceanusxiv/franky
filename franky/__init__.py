@@ -6,6 +6,7 @@ from .desk import (
     DeskError,
     FrankaAPIError,
     TakeControlTimeoutError,
+    TOKEN_STORAGE_PATH,
     PilotButton,
     PilotButtonEvent,
     BrakeState,

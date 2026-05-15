@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import configparser
 import hashlib
 import http.client
 import json
 import logging
+import os
 import ssl
 import time
 import urllib.parse
@@ -17,6 +19,16 @@ from typing import Optional, Any, Literal
 import websockets.sync.client as ws_sync
 
 logger = logging.getLogger(__name__)
+
+
+def _user_config_home() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home and os.path.isabs(config_home):
+        return config_home
+    return os.path.expanduser("~/.config")
+
+
+TOKEN_STORAGE_PATH = os.path.join(_user_config_home(), "franky", "control_tokens.conf")
 
 
 class DeskError(Exception):
@@ -67,6 +79,13 @@ class BrakeState(Enum):
     UNLOCKED = "Unlocked"
 
 
+class NoTokenIdType:
+    pass
+
+
+NO_TOKEN_ID = NoTokenIdType()
+
+
 @dataclass(frozen=True)
 class PilotButtonEvent:
     """A single Pilot button state change."""
@@ -77,6 +96,83 @@ class PilotButtonEvent:
     def __repr__(self) -> str:
         action = "pressed" if self.pressed else "released"
         return f"PilotButtonEvent({self.button.value} {action})"
+
+
+@dataclass(frozen=True)
+class _ControlToken:
+    id: str | NoTokenIdType
+    token: str
+
+
+class _ControlTokenStore:
+    _NO_TOKEN_ID = "__NO_TOKEN_ID__"
+
+    def __init__(self, path: str):
+        self._path = os.path.expanduser(path)
+
+    def _section(self, api: str, hostname: str, username: str) -> str:
+        return f"{api}:{hostname}:{username}"
+
+    def _write(self, config: configparser.ConfigParser) -> None:
+        directory = os.path.dirname(self._path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as config_file:
+            config.write(config_file)
+        os.chmod(self._path, 0o600)
+
+    def load(self, api: str, hostname: str, username: str) -> _ControlToken | None:
+        config = configparser.ConfigParser()
+        if not os.path.exists(self._path):
+            return None
+        config.read(self._path)
+        section = self._section(api, hostname, username)
+        if not config.has_section(section):
+            return None
+        token_id = config.get(section, "id", fallback="")
+        token = config.get(section, "token", fallback="")
+        if not token_id or not token:
+            return None
+        if token_id == self._NO_TOKEN_ID:
+            return _ControlToken(id=NO_TOKEN_ID, token=token)
+        return _ControlToken(id=token_id, token=token)
+
+    def save(
+        self, api: str, hostname: str, username: str, control_token: _ControlToken
+    ) -> None:
+        config = configparser.ConfigParser()
+        if os.path.exists(self._path):
+            config.read(self._path)
+        token_id = (
+            self._NO_TOKEN_ID
+            if control_token.id is NO_TOKEN_ID
+            else str(control_token.id)
+        )
+        config[self._section(api, hostname, username)] = {
+            "id": token_id,
+            "token": control_token.token,
+        }
+        self._write(config)
+
+    def delete(self, api: str, hostname: str, username: str) -> None:
+        if not os.path.exists(self._path):
+            return
+        config = configparser.ConfigParser()
+        config.read(self._path)
+        if not config.remove_section(self._section(api, hostname, username)):
+            return
+        self._write(config)
+
+
+def _make_control_token_store(
+    token_storage: bool | str | os.PathLike,
+) -> _ControlTokenStore | None:
+    if token_storage is False:
+        return None
+    if token_storage is True:
+        return _ControlTokenStore(TOKEN_STORAGE_PATH)
+    return _ControlTokenStore(os.fspath(token_storage))
 
 
 def _encode_password(user: str, password: str) -> str:
@@ -92,15 +188,25 @@ def _encode_password(user: str, password: str) -> str:
 
 
 class BaseDesk(ABC):
-    def __init__(self, hostname: str, username: str, password: str):
+    def __init__(
+        self,
+        hostname: str,
+        username: str,
+        password: str,
+        token_storage: bool | str | os.PathLike = False,
+        token_store_api: str = "",
+    ):
         super().__init__()
         self.__hostname = hostname
         self.__username = username
         self.__password = password
+        self.__token_store_api = token_store_api
+        self.__token_store = _make_control_token_store(token_storage)
         self.__pilot_button_socket = None
         self.__client = None
-        self.__control_token = None
-        self.__control_token_id = None
+        stored_token = self.__load_control_token()
+        self.__control_token = stored_token.token if stored_token is not None else None
+        self.__control_token_id = stored_token.id if stored_token is not None else None
 
     def open(self, timeout: float = 30.0):
         if self.is_open:
@@ -113,23 +219,27 @@ class BaseDesk(ABC):
     def close(self):
         if not self.is_open:
             raise RuntimeError("Session is not open.")
-        self._close_pilot_button_socket()
-        if self.__control_token is not None:
-            self.release_control()
-        self.__client.close()
-        self.__client = None
+        try:
+            self._close_pilot_button_socket()
+            if self.__control_token is not None:
+                if self.has_control:
+                    self.release_control()
+                else:
+                    self.__clear_control_token(delete_from_store=True)
+        finally:
+            self._close_client()
 
     def take_control(self, wait_timeout: float = 30.0, force: bool = False):
         if not self.has_control:
             self.__control_token_id, self.__control_token = self._take_control(
                 wait_timeout=wait_timeout, force=force
             )
+            self.__save_control_token()
 
     def release_control(self):
         if self.__control_token is not None:
             self._release_control()
-        self.__control_token = None
-        self.__control_token_id = None
+        self.__clear_control_token(delete_from_store=True)
 
     def send_api_request(
         self,
@@ -380,6 +490,40 @@ class BaseDesk(ABC):
                 "Client does not have control. Call take_control() first."
             )
 
+    def __load_control_token(self) -> _ControlToken | None:
+        if self.__token_store is None:
+            return None
+        return self.__token_store.load(
+            self.__token_store_api, self.__hostname, self.__username
+        )
+
+    def __save_control_token(self) -> None:
+        if (
+            self.__token_store is None
+            or self.__control_token_id is None
+            or self.__control_token is None
+        ):
+            return
+        self.__token_store.save(
+            self.__token_store_api,
+            self.__hostname,
+            self.__username,
+            _ControlToken(id=self.__control_token_id, token=self.__control_token),
+        )
+
+    def __clear_control_token(self, delete_from_store: bool = False) -> None:
+        self.__control_token = None
+        self.__control_token_id = None
+        if delete_from_store and self.__token_store is not None:
+            self.__token_store.delete(
+                self.__token_store_api, self.__hostname, self.__username
+            )
+
+    def _close_client(self) -> None:
+        if self.__client is not None:
+            self.__client.close()
+            self.__client = None
+
     def _get_pilot_button_socket(self):
         if self.__pilot_button_socket is None:
             uri = f"wss://{self.__hostname}/desk/api/navigation/events"
@@ -472,13 +616,6 @@ class BaseDesk(ABC):
         return self._get_brake_state()
 
 
-class NoTokenIdType:
-    pass
-
-
-NO_TOKEN_ID = NoTokenIdType()
-
-
 class DeskWebSession(BaseDesk):
     """Desk web session for the legacy Franka Desk API.
 
@@ -486,8 +623,20 @@ class DeskWebSession(BaseDesk):
     firmware, use :class:`Desk` instead.
     """
 
-    def __init__(self, hostname: str, username: str, password: str):
-        super().__init__(hostname, username, password)
+    def __init__(
+        self,
+        hostname: str,
+        username: str,
+        password: str,
+        token_storage: bool | str | os.PathLike = False,
+    ):
+        super().__init__(
+            hostname,
+            username,
+            password,
+            token_storage=token_storage,
+            token_store_api="legacy",
+        )
         self.__token = None
 
     def _get_pilot_auth_headers(self) -> dict[str, str]:
@@ -511,7 +660,7 @@ class DeskWebSession(BaseDesk):
                 response_encoding="text",
             )
         except:
-            self.close()
+            self._close_client()
             raise
 
     def close(self):
@@ -534,7 +683,7 @@ class DeskWebSession(BaseDesk):
         # base class once this method returns.
         def granted() -> bool:
             active_token = self._get_system_status()["controlToken"]["activeToken"]
-            return active_token is not None and active_token["id"] == token_id
+            return active_token is not None and str(active_token["id"]) == str(token_id)
 
         start = time.time()
         has_control = granted()
@@ -545,12 +694,15 @@ class DeskWebSession(BaseDesk):
             raise TakeControlTimeoutError(
                 f"Timed out waiting for control to be granted after {wait_timeout}s."
             )
-        return token_id, token
+        return str(token_id), token
 
     def _get_has_control(self):
         status = self._get_system_status()
         active_token = status["controlToken"]["activeToken"]
-        return active_token is not None and active_token["id"] == self.control_token_id
+        return (
+            active_token is not None
+            and str(active_token["id"]) == self.control_token_id
+        )
 
     def _release_control(self):
         self.send_control_api_request(
@@ -645,8 +797,20 @@ class Desk(BaseDesk):
     on System 5+ firmware. For older firmware, use :class:`DeskWebSession`.
     """
 
-    def __init__(self, hostname: str, username: str, password: str):
-        super().__init__(hostname, username, password)
+    def __init__(
+        self,
+        hostname: str,
+        username: str,
+        password: str,
+        token_storage: bool | str | os.PathLike = False,
+    ):
+        super().__init__(
+            hostname,
+            username,
+            password,
+            token_storage=token_storage,
+            token_store_api="v1",
+        )
         self.__warned_no_token_id = False
 
     def _get_pilot_auth_headers(self) -> dict[str, str]:
@@ -661,7 +825,7 @@ class Desk(BaseDesk):
             # Verify connectivity and credentials right away.
             self._get_system_status()
         except:
-            self.close()
+            self._close_client()
             raise
 
     def _take_control(self, wait_timeout: float = 30.0, force: bool = False):
@@ -687,7 +851,7 @@ class Desk(BaseDesk):
                 )
                 self.__warned_no_token_id = True
             return data.get("owner") == self.username
-        return data.get("tokenId") == self.control_token_id
+        return str(data.get("tokenId")) == str(self.control_token_id)
 
     def _get_operating_mode(self) -> OperatingMode:
         data = self.send_api_request("/api/system/operating-mode", method="GET")
