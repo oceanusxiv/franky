@@ -19,7 +19,11 @@ void bind_robot(py::module &);
 void bind_robot_state(py::module &);
 void bind_state_repr(py::module &);
 
+#if defined(Py_GIL_DISABLED)
+PYBIND11_MODULE(_franky, m, py::mod_gil_not_used()) {
+#else
 PYBIND11_MODULE(_franky, m) {
+#endif
   m.doc() = "High-Level Control Library for Franka Robots";
 
   bind_misc(m);
