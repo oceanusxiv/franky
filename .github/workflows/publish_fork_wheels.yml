@@ -36,6 +36,7 @@ jobs:
     with:
       libfranka-version: ${{ inputs.libfranka-version }}
       manylinux-version: ${{ matrix.manylinux-version }}
+      libfranka-version-label: ${{ inputs.libfranka-version }}
 
   build-all:
     needs: get-versions
@@ -49,6 +50,7 @@ jobs:
     with:
       libfranka-version: ${{ matrix.libfranka-version }}
       manylinux-version: ${{ matrix.manylinux-version }}
+      libfranka-version-label: ${{ matrix.libfranka-version }}
 
   release-one:
     needs: build-one
@@ -63,21 +65,18 @@ jobs:
       RELEASE_TAG: ${{ inputs.release-tag || format('wheels-libfranka-{0}', inputs.libfranka-version) }}
 
     steps:
-      - name: Download wheel archives
-        uses: actions/download-artifact@v4
+      - name: Download wheels
+        uses: actions/download-artifact@v8
         with:
-          path: artifacts/
+          pattern: wheels___${{ env.LIBFRANKA_VERSION }}___*
+          path: release/dist/
+          merge-multiple: true
 
       - name: Prepare release assets
         run: |
           set -euo pipefail
 
-          mkdir -p release/dist release/archive
-
-          for archive in artifacts/wheels___${LIBFRANKA_VERSION}___*/*.zip; do
-            echo "Unpacking ${archive}"
-            unzip -q -o "${archive}" -d release
-          done
+          mkdir -p release/archive
 
           wheel_count=$(find release/dist -name '*.whl' | wc -l)
           if [[ "${wheel_count}" -eq 0 ]]; then
@@ -146,21 +145,18 @@ jobs:
       RELEASE_TAG: wheels-libfranka-${{ matrix.libfranka-version }}
 
     steps:
-      - name: Download wheel archives
-        uses: actions/download-artifact@v4
+      - name: Download wheels
+        uses: actions/download-artifact@v8
         with:
-          path: artifacts/
+          pattern: wheels___${{ env.LIBFRANKA_VERSION }}___*
+          path: release/dist/
+          merge-multiple: true
 
       - name: Prepare release assets
         run: |
           set -euo pipefail
 
-          mkdir -p release/dist release/archive
-
-          for archive in artifacts/wheels___${LIBFRANKA_VERSION}___*/*.zip; do
-            echo "Unpacking ${archive}"
-            unzip -q -o "${archive}" -d release
-          done
+          mkdir -p release/archive
 
           wheel_count=$(find release/dist -name '*.whl' | wc -l)
           if [[ "${wheel_count}" -eq 0 ]]; then
