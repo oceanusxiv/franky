@@ -79,9 +79,8 @@ JointImpedanceParams makeJointImpedanceParams(
     const std::optional<Vector7d> &constant_torque_offset, const std::optional<Vector7d> &lower_joint_limits,
     const std::optional<Vector7d> &upper_joint_limits, bool compensate_coriolis, double max_delta_tau,
     double joint_limit_activation_distance, double joint_limit_stiffness, double joint_limit_damping,
-    double joint_limit_max_torque, const std::optional<Vector7d> &friction_coulomb,
-    const std::optional<Vector7d> &friction_viscous, const std::optional<Vector7d> &friction_max_torque,
-    double friction_velocity_epsilon) {
+    double joint_limit_max_torque, const std::optional<FrictionCompensationParams> &friction,
+    const std::optional<Vector6d> &cartesian_stiffness, const std::optional<Vector6d> &cartesian_damping) {
   auto params = JointImpedanceParams{};
   if (stiffness.has_value()) {
     validateNonNegativeFinite(stiffness.value(), "stiffness");
@@ -92,26 +91,14 @@ JointImpedanceParams makeJointImpedanceParams(
     validateNonNegativeFinite(damping.value(), "damping");
     params.damping = damping.value();
   }
-  if (friction_velocity_epsilon <= 0.0 || !std::isfinite(friction_velocity_epsilon)) {
-    throw py::value_error("friction_velocity_epsilon must be finite and positive");
-  }
-  if (friction_coulomb.has_value()) {
-    validateNonNegativeFinite(friction_coulomb.value(), "friction_coulomb");
-    params.friction.coulomb = friction_coulomb.value();
-  }
-  if (friction_viscous.has_value()) {
-    validateNonNegativeFinite(friction_viscous.value(), "friction_viscous");
-    params.friction.viscous = friction_viscous.value();
-  }
-  if (friction_max_torque.has_value()) {
-    validateNonNegativeFinite(friction_max_torque.value(), "friction_max_torque");
-    params.friction.max_torque = friction_max_torque.value();
+  if (friction.has_value()) {
+    validateFrictionCompensationParams(*friction);
+    params.friction = *friction;
   }
   if (constant_torque_offset.has_value()) params.constant_torque_offset = constant_torque_offset.value();
   params.safety.lower_joint_limits = lower_joint_limits;
   params.safety.upper_joint_limits = upper_joint_limits;
   params.compensate_coriolis = compensate_coriolis;
-  params.friction.velocity_epsilon = friction_velocity_epsilon;
   params.safety.max_delta_tau = max_delta_tau;
   params.safety.joint_limit_activation_distance = joint_limit_activation_distance;
   params.safety.joint_limit_stiffness = joint_limit_stiffness;
@@ -411,7 +398,7 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
       .def_readwrite("constant_torque_offset", &JointImpedanceParams::constant_torque_offset)
       .def_readwrite("compensate_coriolis", &JointImpedanceParams::compensate_coriolis)
       .def_readwrite("safety", &JointImpedanceParams::safety)
-      .def_readwrite("friction", &JointImpedanceParams::friction);
+      .def_readwrite("friction", &JointImpedanceParams::friction)
 
   py::class_<CartesianImpedanceBase::Params>(m, "CartesianImpedanceParams")
       .def(py::init<>())
@@ -460,13 +447,8 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_stiffness,
                         double joint_limit_damping,
                         double joint_limit_max_torque,
-                        std::optional<Vector7d>
-                            friction_coulomb,
-                        std::optional<Vector7d>
-                            friction_viscous,
-                        std::optional<Vector7d>
-                            friction_max_torque,
-                        double friction_velocity_epsilon) {
+                        std::optional<FrictionCompensationParams>
+                            friction,
             auto params = makeJointImpedanceParams(
                 stiffness,
                 damping,
@@ -479,10 +461,9 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
-                friction_coulomb,
-                friction_viscous,
-                friction_max_torque,
-                friction_velocity_epsilon);
+                friction,
+                cartesian_stiffness,
+                cartesian_damping);
 
             const Vector7d target_vector = target;
             if (target_velocity.has_value()) {
@@ -503,10 +484,7 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
           "joint_limit_stiffness"_a = 4.0,
           "joint_limit_damping"_a = 1.0,
           "joint_limit_max_torque"_a = 5.0,
-          "friction_coulomb"_a = std::nullopt,
-          "friction_viscous"_a = std::nullopt,
-          "friction_max_torque"_a = std::nullopt,
-          "friction_velocity_epsilon"_a = 0.03)
+          "friction"_a = std::nullopt,
       .def_property_readonly("target", &JointImpedanceMotion::target)
       .def_property_readonly("target_velocity", &JointImpedanceMotion::target_velocity)
       .def_property_readonly("params", [](const JointImpedanceMotion &m) { return m.params(); });
@@ -531,13 +509,12 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_stiffness,
                         double joint_limit_damping,
                         double joint_limit_max_torque,
-                        std::optional<Vector7d>
-                            friction_coulomb,
-                        std::optional<Vector7d>
-                            friction_viscous,
-                        std::optional<Vector7d>
-                            friction_max_torque,
-                        double friction_velocity_epsilon,
+                        std::optional<FrictionCompensationParams>
+                            friction,
+                        std::optional<Vector6d>
+                            cartesian_stiffness,
+                        std::optional<Vector6d>
+                            cartesian_damping,
                         std::shared_ptr<JointImpedanceGainsHandle>
                             gains_handle,
                         double gains_time_constant) {
@@ -553,13 +530,10 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
-                friction_coulomb,
-                friction_viscous,
-                friction_max_torque,
-                friction_velocity_epsilon);
             if (gains_handle) {
               return std::make_shared<JointImpedanceTrackingMotion>(
                   reference_handle, params, gains_handle, gains_time_constant);
+                friction,
             }
             return std::make_shared<JointImpedanceTrackingMotion>(reference_handle, params);
           }),
@@ -581,10 +555,7 @@ interpolates toward them with the given time constant, allowing smooth runtime s
           "joint_limit_stiffness"_a = 4.0,
           "joint_limit_damping"_a = 1.0,
           "joint_limit_max_torque"_a = 5.0,
-          "friction_coulomb"_a = std::nullopt,
-          "friction_viscous"_a = std::nullopt,
-          "friction_max_torque"_a = std::nullopt,
-          "friction_velocity_epsilon"_a = 0.03,
+          "friction"_a = std::nullopt,
           "gains_handle"_a = nullptr,
           "gains_time_constant"_a = 0.1)
       .def_property_readonly("target", &JointImpedanceTrackingMotion::target)

@@ -677,26 +677,32 @@ Joint tracking targets can optionally include feedforward torques `tau_ff`. This
 added on top of any `constant_torque_offset` configured on the tracker itself.
 
 All joint-space impedance motions (`JointImpedanceMotion`, `JointImpedanceTrackingMotion`,
-and `JointImpedanceTracker`) support optional friction compensation. Coulomb and viscous
-terms are added as feedforward terms to the commanded torque each cycle and clamped per joint:
+and `JointImpedanceTracker`) support optional friction compensation via a
+`FrictionCompensationParams` object, the same type used by Cartesian impedance. Coulomb and
+viscous terms are added as feedforward terms to the commanded torque each cycle and clamped
+per joint:
 
 ```python
+from franky import FrictionCompensationParams, JointImpedanceTracker
+
 # Use friction compensation to get a smooth zero-g mode kinesthetic demonstrations
 with JointImpedanceTracker(
     robot,
     stiffness=[0.0] * 7,
     damping=[0.0] * 7,
-    friction_coulomb=[0.5, 0.5, 0.4, 0.4, 0.3, 0.3, 0.2],   # [Nm]
-    friction_viscous=[0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05], # [Nms/rad]
-    friction_max_torque=[2.0] * 7,  # per-joint clamp [Nm]
+    friction=FrictionCompensationParams(
+        coulomb=[0.5, 0.5, 0.4, 0.4, 0.3, 0.3, 0.2],   # [Nm]
+        viscous=[0.1, 0.1, 0.1, 0.1, 0.05, 0.05, 0.05], # [Nms/rad]
+        max_torque=[2.0] * 7,  # per-joint clamp [Nm]
+    ),
     period=0.01,
 ) as tracker:
     ...
 ```
 
 The Coulomb term uses a smooth sign approximation controlled by
-`friction_velocity_epsilon` (default `0.03 rad/s`). Either or both terms can
-be omitted; unset terms default to zero.
+`FrictionCompensationParams.velocity_epsilon` (default `0.03 rad/s`). Any field can
+be omitted; unset fields default to zero (or `0.03` for `velocity_epsilon`).
 
 Both trackers support updating impedance gains at runtime via `set_gains()`.
 Changes are smoothed in the RT loop using exponential interpolation, so abrupt
