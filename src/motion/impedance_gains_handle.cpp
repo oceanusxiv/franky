@@ -38,4 +38,22 @@ JointImpedanceGains JointImpedanceGainsHandle::get() const {
   return buffers_[active_index];
 }
 
+// --- HybridCartesianGainsHandle ---
+
+void HybridCartesianGainsHandle::set(const HybridCartesianGains &gains) {
+  const uint8_t next_index = 1 - active_index_.load(std::memory_order_relaxed);
+  buffers_[next_index] = gains;
+  active_index_.store(next_index, std::memory_order_release);
+  valid_.store(true, std::memory_order_release);
+}
+
+void HybridCartesianGainsHandle::clear() { valid_.store(false, std::memory_order_release); }
+
+bool HybridCartesianGainsHandle::hasGains() const { return valid_.load(std::memory_order_acquire); }
+
+HybridCartesianGains HybridCartesianGainsHandle::get() const {
+  const uint8_t active_index = active_index_.load(std::memory_order_acquire);
+  return buffers_[active_index];
+}
+
 }  // namespace franky

@@ -36,20 +36,54 @@ struct JointImpedanceParams {
 
   /** Joint friction compensation settings. */
   FrictionCompensationParams friction{};
+
+  /**
+   * Optional Cartesian-shaped gain term (see HybridCartesianGains).
+   *
+   * nullopt (default) disables the hybrid path entirely: Set to
+   * enable a hybrid controller that adds J^T * diag(cartesian_stiffness) * J on top of
+   * the joint stiffness/damping above, projecting Cartesian compliance into joint
+   * space via the current Jacobian. Whether the hybrid path is active is fixed for the
+   * lifetime of the motion; it cannot be toggled at runtime, only its values (via
+   * RuntimeOptions::cartesian_gains_handle).
+   */
+  std::optional<HybridCartesianGains> cartesian_gains{std::nullopt};
 };
 
 class JointImpedanceBase : public Motion<franka::Torques> {
  public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  /**
+   * @brief Runtime update handles for long-lived joint impedance motions.
+   */
+  struct RuntimeOptions {
+    /** Optional handle for runtime joint stiffness/damping updates. */
+    std::shared_ptr<JointImpedanceGainsHandle> gains_handle{};
+
+    /** Optional handle for runtime hybrid Cartesian gain updates. */
+    std::shared_ptr<HybridCartesianGainsHandle> cartesian_gains_handle{};
+
+    /** Smoothing time constant for runtime gain transitions [s]. */
+    double gains_time_constant{0.1};
+  };
+
   [[nodiscard]] const Vector7d &target() const { return target_; }
   [[nodiscard]] const Vector7d &target_velocity() const { return target_velocity_; }
   [[nodiscard]] const JointImpedanceParams &params() const { return params_; }
 
  protected:
+  // Note: RuntimeOptions intentionally has no default argument on the constructor
+  // below — a nested aggregate's default member initializers can't be used as a
+  // default argument of an enclosing class's own member declared before the class is
+  // complete (a hard compiler error, not just a style preference). Callers that don't
+  // need runtime handles use the RuntimeOptions-less overload instead, which mirrors
+  // CartesianImpedanceBase's two-constructor split.
   explicit JointImpedanceBase(
+      const Vector7d &target, const Vector7d &target_velocity, const JointImpedanceParams &params);
+  JointImpedanceBase(
       const Vector7d &target, const Vector7d &target_velocity, const JointImpedanceParams &params,
-      std::shared_ptr<JointImpedanceGainsHandle> gains_handle = nullptr, double gains_time_constant = 0.1);
+      RuntimeOptions runtime);
 
   [[nodiscard]] franka::Torques computeCommand(
       const RobotState &robot_state, const JointReference &reference, double dt);
@@ -59,10 +93,20 @@ class JointImpedanceBase : public Motion<franka::Torques> {
   Vector7d target_velocity_;
 
  private:
+  /** Resolved, continuously-smoothed hybrid Cartesian gain state. */
+  struct HybridState {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Vector6d stiffness;
+    Vector6d damping;
+  };
+
   std::shared_ptr<JointImpedanceGainsHandle> gains_handle_;
+  std::shared_ptr<HybridCartesianGainsHandle> cartesian_gains_handle_;
   double gains_time_constant_;
   Vector7d current_stiffness_;
   Vector7d current_damping_;
+  // nullopt <=> hybrid path disabled; presence is the only flag needed.
+  std::optional<HybridState> hybrid_;
 };
 
 class JointImpedanceMotion : public JointImpedanceBase {

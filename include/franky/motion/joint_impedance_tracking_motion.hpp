@@ -81,8 +81,7 @@ class JointImpedanceTrackingMotion : public JointImpedanceBase {
   explicit JointImpedanceTrackingMotion(std::shared_ptr<JointReferenceHandle> reference_handle);
   JointImpedanceTrackingMotion(std::shared_ptr<JointReferenceHandle> reference_handle, const Params &params);
   JointImpedanceTrackingMotion(
-      std::shared_ptr<JointReferenceHandle> reference_handle, const Params &params,
-      std::shared_ptr<JointImpedanceGainsHandle> gains_handle, double gains_time_constant = 0.1);
+      std::shared_ptr<JointReferenceHandle> reference_handle, const Params &params, RuntimeOptions runtime);
   explicit JointImpedanceTrackingMotion(ReferenceCallback reference_callback);
   JointImpedanceTrackingMotion(ReferenceCallback reference_callback, const Params &params);
 

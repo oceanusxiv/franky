@@ -41,6 +41,14 @@ void validateNonNegativeFinite(const Vector7d &values, const char *name) {
   }
 }
 
+void validateNonNegativeFinite(const Vector6d &values, const char *name) {
+  for (int i = 0; i < values.size(); ++i) {
+    if (!std::isfinite(values[i]) || values[i] < 0.0) {
+      throw py::value_error(std::string(name) + " must contain only finite, non-negative values");
+    }
+  }
+}
+
 void validateFrictionCompensationParams(const FrictionCompensationParams &friction) {
   validateNonNegativeFinite(friction.coulomb, "friction.coulomb");
   validateNonNegativeFinite(friction.viscous, "friction.viscous");
@@ -141,7 +149,8 @@ JointImpedanceParams makeJointImpedanceParams(
     const std::optional<Vector7d> &constant_torque_offset, const std::optional<Vector7d> &lower_joint_limits,
     const std::optional<Vector7d> &upper_joint_limits, bool compensate_coriolis, double max_delta_tau,
     double joint_limit_activation_distance, double joint_limit_stiffness, double joint_limit_damping,
-    double joint_limit_max_torque, const std::optional<FrictionCompensationParams> &friction) {
+    double joint_limit_max_torque, const std::optional<FrictionCompensationParams> &friction,
+    const std::optional<Vector6d> &cartesian_stiffness, const std::optional<Vector6d> &cartesian_damping) {
   auto params = JointImpedanceParams{};
   if (stiffness.has_value()) {
     validateNonNegativeFinite(stiffness.value(), "stiffness");
@@ -157,6 +166,18 @@ JointImpedanceParams makeJointImpedanceParams(
     params.friction = *friction;
   }
   if (constant_torque_offset.has_value()) params.constant_torque_offset = constant_torque_offset.value();
+  if (cartesian_stiffness.has_value()) {
+    validateNonNegativeFinite(cartesian_stiffness.value(), "cartesian_stiffness");
+    HybridCartesianGains cartesian_gains;
+    cartesian_gains.stiffness = cartesian_stiffness.value();
+    if (cartesian_damping.has_value()) {
+      validateNonNegativeFinite(cartesian_damping.value(), "cartesian_damping");
+      cartesian_gains.damping = cartesian_damping.value();
+    }
+    params.cartesian_gains = cartesian_gains;
+  } else if (cartesian_damping.has_value()) {
+    throw py::value_error("cartesian_damping requires cartesian_stiffness to be set");
+  }
   params.safety.lower_joint_limits = lower_joint_limits;
   params.safety.upper_joint_limits = upper_joint_limits;
   params.compensate_coriolis = compensate_coriolis;
@@ -417,6 +438,45 @@ See also CartesianImpedanceGains.isotropic and CartesianImpedanceGains.diagonal 
       .def("get", &JointImpedanceGainsHandle::get)
       .def_property_readonly("has_gains", &JointImpedanceGainsHandle::hasGains);
 
+  py::class_<HybridCartesianGains>(m, "HybridCartesianGains")
+      .def(
+          py::init<>([](const std::optional<Vector6d> &stiffness, const std::optional<Vector6d> &damping) {
+            HybridCartesianGains g;
+            if (stiffness.has_value()) {
+              validateNonNegativeFinite(stiffness.value(), "stiffness");
+              g.stiffness = stiffness.value();
+            }
+            if (damping.has_value()) {
+              validateNonNegativeFinite(damping.value(), "damping");
+              g.damping = damping.value();
+            }
+            return g;
+          }),
+          "stiffness"_a = std::nullopt,
+          "damping"_a = std::nullopt)
+      .def_readwrite("stiffness", &HybridCartesianGains::stiffness)
+      .def_readwrite("damping", &HybridCartesianGains::damping);
+
+  py::class_<HybridCartesianGainsHandle, std::shared_ptr<HybridCartesianGainsHandle>>(m, "HybridCartesianGainsHandle")
+      .def(py::init<>())
+      .def(
+          "set",
+          [](HybridCartesianGainsHandle &handle, const Vector6d &stiffness, const std::optional<Vector6d> &damping) {
+            validateNonNegativeFinite(stiffness, "stiffness");
+            HybridCartesianGains gains;
+            gains.stiffness = stiffness;
+            if (damping.has_value()) {
+              validateNonNegativeFinite(damping.value(), "damping");
+              gains.damping = damping.value();
+            }
+            handle.set(gains);
+          },
+          "stiffness"_a,
+          "damping"_a = std::nullopt)
+      .def("clear", &HybridCartesianGainsHandle::clear)
+      .def("get", &HybridCartesianGainsHandle::get)
+      .def_property_readonly("has_gains", &HybridCartesianGainsHandle::hasGains);
+
   py::class_<JointReferenceHandle, std::shared_ptr<JointReferenceHandle>>(m, "JointReferenceHandle")
       .def(py::init<>())
       .def(
@@ -499,7 +559,8 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
       .def_readwrite("constant_torque_offset", &JointImpedanceParams::constant_torque_offset)
       .def_readwrite("compensate_coriolis", &JointImpedanceParams::compensate_coriolis)
       .def_readwrite("safety", &JointImpedanceParams::safety)
-      .def_readwrite("friction", &JointImpedanceParams::friction);
+      .def_readwrite("friction", &JointImpedanceParams::friction)
+      .def_readwrite("cartesian_gains", &JointImpedanceParams::cartesian_gains);
 
   py::class_<CartesianImpedanceBase::Params>(m, "CartesianImpedanceParams")
       .def(py::init<>())
@@ -547,7 +608,11 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_damping,
                         double joint_limit_max_torque,
                         std::optional<FrictionCompensationParams>
-                            friction) {
+                            friction,
+                        std::optional<Vector6d>
+                            cartesian_stiffness,
+                        std::optional<Vector6d>
+                            cartesian_damping) {
             auto params = makeJointImpedanceParams(
                 stiffness,
                 damping,
@@ -560,7 +625,9 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
-                friction);
+                friction,
+                cartesian_stiffness,
+                cartesian_damping);
 
             const Vector7d target_vector = target;
             if (target_velocity.has_value()) {
@@ -568,6 +635,14 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
             }
             return std::make_shared<JointImpedanceMotion>(target_vector, params);
           }),
+          R"doc(Construct a static joint impedance controller.
+
+If cartesian_stiffness is provided, the controller additionally shapes its effective
+joint stiffness/damping using Cartesian-space gains projected through the current
+Jacobian: tau = (diag(stiffness) + J^T diag(cartesian_stiffness) J) @ (q_des - q) + ...,
+allowing per-axis (x, y, z, rx, ry, rz) compliance at the end effector while still
+tracking a joint-space target. cartesian_damping defaults to critical damping,
+2*sqrt(cartesian_stiffness), per axis.)doc",
           "target"_a,
           "target_velocity"_a = std::nullopt,
           "stiffness"_a = std::nullopt,
@@ -581,7 +656,9 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
           "joint_limit_stiffness"_a = 4.0,
           "joint_limit_damping"_a = 1.0,
           "joint_limit_max_torque"_a = 5.0,
-          "friction"_a = std::nullopt)
+          "friction"_a = std::nullopt,
+          "cartesian_stiffness"_a = std::nullopt,
+          "cartesian_damping"_a = std::nullopt)
       .def_property_readonly("target", &JointImpedanceMotion::target)
       .def_property_readonly("target_velocity", &JointImpedanceMotion::target_velocity)
       .def_property_readonly("params", [](const JointImpedanceMotion &m) { return m.params(); });
@@ -608,9 +685,18 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_max_torque,
                         std::optional<FrictionCompensationParams>
                             friction,
+                        std::optional<Vector6d>
+                            cartesian_stiffness,
+                        std::optional<Vector6d>
+                            cartesian_damping,
                         std::shared_ptr<JointImpedanceGainsHandle>
                             gains_handle,
+                        std::shared_ptr<HybridCartesianGainsHandle>
+                            cartesian_gains_handle,
                         double gains_time_constant) {
+            if (cartesian_gains_handle && !cartesian_stiffness.has_value()) {
+              throw py::value_error("cartesian_gains_handle requires cartesian_stiffness to be set");
+            }
             auto params = makeJointImpedanceParams(
                 stiffness,
                 damping,
@@ -623,10 +709,15 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
-                friction);
-            if (gains_handle) {
-              return std::make_shared<JointImpedanceTrackingMotion>(
-                  reference_handle, params, gains_handle, gains_time_constant);
+                friction,
+                cartesian_stiffness,
+                cartesian_damping);
+            if (gains_handle || cartesian_gains_handle) {
+              auto runtime = JointImpedanceBase::RuntimeOptions{};
+              runtime.gains_handle = std::move(gains_handle);
+              runtime.cartesian_gains_handle = std::move(cartesian_gains_handle);
+              runtime.gains_time_constant = gains_time_constant;
+              return std::make_shared<JointImpedanceTrackingMotion>(reference_handle, params, std::move(runtime));
             }
             return std::make_shared<JointImpedanceTrackingMotion>(reference_handle, params);
           }),
@@ -635,7 +726,12 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
 Any constant_torque_offset configured here is added to the per-cycle torque_feedforward values published through the handle.
 
 If gains_handle is provided, the controller reads target gains from it each cycle and exponentially
-interpolates toward them with the given time constant, allowing smooth runtime stiffness/damping changes.)doc",
+interpolates toward them with the given time constant, allowing smooth runtime stiffness/damping changes.
+
+If cartesian_stiffness is provided, the controller additionally shapes its effective joint stiffness/damping using
+Cartesian-space gains projected through the current Jacobian (see JointImpedanceMotion). If cartesian_gains_handle is
+also provided, it is used to update those Cartesian gains at runtime the same way gains_handle updates
+stiffness/damping.)doc",
           "reference_handle"_a,
           "stiffness"_a = std::nullopt,
           "damping"_a = std::nullopt,
@@ -649,7 +745,10 @@ interpolates toward them with the given time constant, allowing smooth runtime s
           "joint_limit_damping"_a = 1.0,
           "joint_limit_max_torque"_a = 5.0,
           "friction"_a = std::nullopt,
+          "cartesian_stiffness"_a = std::nullopt,
+          "cartesian_damping"_a = std::nullopt,
           "gains_handle"_a = nullptr,
+          "cartesian_gains_handle"_a = nullptr,
           "gains_time_constant"_a = 0.1)
       .def_property_readonly("target", &JointImpedanceTrackingMotion::target)
       .def_property_readonly("target_velocity", &JointImpedanceTrackingMotion::target_velocity)

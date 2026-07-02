@@ -150,4 +150,48 @@ class JointImpedanceGainsHandle {
   std::atomic<bool> valid_{false};
 };
 
+/**
+ * @brief Per-axis Cartesian gains for the hybrid joint impedance shaping term.
+ *
+ * When set on JointImpedanceParams, the controller adds J^T * diag(stiffness) * J to
+ * the joint-space stiffness matrix (and similarly for damping) each control tick,
+ * projecting Cartesian compliance into joint space via the current Jacobian. Axis
+ * order is [x, y, z, rx, ry, rz] in the base frame at the end-effector, matching
+ * Model::zeroJacobian's row order.
+ *
+ * Damping defaults to nullopt, which means the controller uses critical damping
+ * (2*sqrt(stiffness)) elementwise. Set explicitly to override.
+ */
+struct HybridCartesianGains {
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  Vector6d stiffness{Vector6d::Zero()};
+  std::optional<Vector6d> damping{std::nullopt};
+};
+
+/**
+ * @brief Double-buffered handle for updating hybrid Cartesian gains online.
+ *
+ * Same lock-free pattern as JointImpedanceGainsHandle.
+ *
+ * Thread safety: at most one thread may call set() or clear() at a time.
+ * Concurrent reads from the RT callback via get() and hasGains() are safe.
+ */
+class HybridCartesianGainsHandle {
+ public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  HybridCartesianGainsHandle() = default;
+
+  void set(const HybridCartesianGains &gains);
+  void clear();
+  [[nodiscard]] bool hasGains() const;
+  [[nodiscard]] HybridCartesianGains get() const;
+
+ private:
+  std::array<HybridCartesianGains, 2> buffers_{};
+  std::atomic<uint8_t> active_index_{0};
+  std::atomic<bool> valid_{false};
+};
+
 }  // namespace franky
