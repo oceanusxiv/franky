@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Eigen/Eigenvalues>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -18,16 +19,75 @@ inline Vector7d defaultJointImpedanceDamping() {
 }
 
 /**
+ * @brief Builds a block-diagonal 6x6 Cartesian gain matrix from isotropic translational and
+ * rotational scalars, matching the [x, y, z, rx, ry, rz] axis order of Model::zeroJacobian.
+ */
+inline Matrix6d cartesianGainBlocks(double translational, double rotational) {
+  Matrix6d gains = Matrix6d::Zero();
+  gains.topLeftCorner<3, 3>() = translational * Eigen::Matrix3d::Identity();
+  gains.bottomRightCorner<3, 3>() = rotational * Eigen::Matrix3d::Identity();
+  return gains;
+}
+
+inline Matrix6d defaultCartesianImpedanceStiffness() { return cartesianGainBlocks(2000.0, 200.0); }
+
+/**
+ * @brief Critical damping for a symmetric PSD Cartesian stiffness matrix, generalizing the
+ * scalar rule 2*sqrt(k) via the matrix square root (D = 2*K^(1/2)).
+ *
+ * For a block-diagonal or diagonal stiffness matrix this reduces exactly to applying 2*sqrt(.)
+ * to each eigenvalue/axis independently, matching the elementwise convention used elsewhere
+ * (e.g. defaultJointImpedanceDamping).
+ */
+inline Matrix6d defaultCartesianImpedanceDamping(const Matrix6d &stiffness) {
+  Eigen::SelfAdjointEigenSolver<Matrix6d> solver(stiffness);
+  return 2.0 * solver.operatorSqrt();
+}
+
+/**
  * @brief Target gains for a Cartesian impedance controller.
  *
+ * stiffness is a full 6x6 matrix in the base frame, ordered [x, y, z, rx, ry, rz] to match
+ * Model::zeroJacobian's row order. It need not be diagonal: off-diagonal terms couple
+ * translational and rotational error into the same wrench axis, which is useful e.g. for
+ * stiffness expressed about an offset frame. It must be symmetric and positive semi-definite.
+ *
  * Damping defaults to nullopt, which means the controller uses critical damping
- * (2*sqrt(stiffness)) for that axis. Set explicitly to override.
+ * (see defaultCartesianImpedanceDamping). Set explicitly to override.
  */
 struct CartesianImpedanceGains {
-  double translational_stiffness{2000.0};
-  double rotational_stiffness{200.0};
-  std::optional<double> translational_damping{std::nullopt};
-  std::optional<double> rotational_damping{std::nullopt};
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+  Matrix6d stiffness{defaultCartesianImpedanceStiffness()};
+  std::optional<Matrix6d> damping{std::nullopt};
+
+  /**
+   * @brief Convenience factory for the common isotropic case: independent translational and
+   * rotational stiffness, with no coupling between axes.
+   */
+  static CartesianImpedanceGains isotropic(
+      double translational_stiffness, double rotational_stiffness,
+      std::optional<double> translational_damping = std::nullopt,
+      std::optional<double> rotational_damping = std::nullopt) {
+    CartesianImpedanceGains gains;
+    gains.stiffness = cartesianGainBlocks(translational_stiffness, rotational_stiffness);
+    if (translational_damping.has_value() || rotational_damping.has_value()) {
+      gains.damping = cartesianGainBlocks(
+          translational_damping.value_or(2.0 * std::sqrt(translational_stiffness)),
+          rotational_damping.value_or(2.0 * std::sqrt(rotational_stiffness)));
+    }
+    return gains;
+  }
+
+  /**
+   * @brief Convenience factory for per-axis stiffness with no cross-axis coupling.
+   */
+  static CartesianImpedanceGains diagonal(const Vector6d &stiffness, std::optional<Vector6d> damping = std::nullopt) {
+    CartesianImpedanceGains gains;
+    gains.stiffness = stiffness.asDiagonal();
+    if (damping.has_value()) gains.damping = damping->asDiagonal();
+    return gains;
+  }
 };
 
 /**
@@ -42,6 +102,8 @@ struct CartesianImpedanceGains {
  */
 class CartesianImpedanceGainsHandle {
  public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
   CartesianImpedanceGainsHandle() = default;
 
   void set(const CartesianImpedanceGains &gains);

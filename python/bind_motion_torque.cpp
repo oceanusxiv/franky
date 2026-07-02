@@ -59,6 +59,68 @@ void validateNonNegativeFinite(double value, const char *name) {
   if (value < 0.0) throw py::value_error(std::string(name) + " must be non-negative");
 }
 
+void validateSymmetricPSD(const Matrix6d &matrix, const char *name) {
+  if (!matrix.allFinite()) throw py::value_error(std::string(name) + " must contain only finite values");
+  constexpr double tolerance = 1e-6;
+  if ((matrix - matrix.transpose()).cwiseAbs().maxCoeff() > tolerance) {
+    throw py::value_error(std::string(name) + " must be symmetric");
+  }
+  Eigen::SelfAdjointEigenSolver<Matrix6d> solver(matrix, Eigen::EigenvaluesOnly);
+  if (solver.eigenvalues().minCoeff() < -tolerance) {
+    throw py::value_error(std::string(name) + " must be positive semi-definite");
+  }
+}
+
+// Accepted forms for the stiffness/damping kwargs: a full 6x6 matrix, or a 6-vector of per-axis
+// (x, y, z, rx, ry, rz) gains with no cross-axis coupling (equivalent to matrix.asDiagonal()).
+using CartesianGainInput = std::variant<Vector6d, Matrix6d>;
+
+Matrix6d toCartesianGainMatrix(const CartesianGainInput &input) {
+  if (std::holds_alternative<Matrix6d>(input)) return std::get<Matrix6d>(input);
+  return std::get<Vector6d>(input).asDiagonal();
+}
+
+// Resolves the stiffness/damping kwargs (matrix or 6-vector) against the legacy isotropic scalar
+// kwargs. At most one of {stiffness, {translational,rotational}_stiffness} may be given, same for
+// damping. translational_stiffness/rotational_stiffness default to 2000.0/200.0 when neither form
+// is given.
+CartesianImpedanceGains resolveCartesianImpedanceGains(
+    const std::optional<CartesianGainInput> &stiffness, const std::optional<CartesianGainInput> &damping,
+    std::optional<double> translational_stiffness, std::optional<double> rotational_stiffness,
+    std::optional<double> translational_damping, std::optional<double> rotational_damping) {
+  if (stiffness.has_value() && (translational_stiffness.has_value() || rotational_stiffness.has_value())) {
+    throw py::value_error("Provide either 'stiffness' or 'translational_stiffness'/'rotational_stiffness', not both");
+  }
+  if (damping.has_value() && (translational_damping.has_value() || rotational_damping.has_value())) {
+    throw py::value_error("Provide either 'damping' or 'translational_damping'/'rotational_damping', not both");
+  }
+  if (stiffness.has_value() && !damping.has_value() &&
+      (translational_damping.has_value() || rotational_damping.has_value())) {
+    throw py::value_error(
+        "'translational_damping'/'rotational_damping' derive their defaults from 'translational_stiffness'/"
+        "'rotational_stiffness'; provide 'damping' as a full matrix (or omit it for critical damping) when "
+        "'stiffness' is given as a matrix");
+  }
+  CartesianImpedanceGains gains;
+  if (stiffness.has_value()) {
+    const Matrix6d matrix = toCartesianGainMatrix(*stiffness);
+    validateSymmetricPSD(matrix, "stiffness");
+    gains.stiffness = matrix;
+  } else {
+    gains = CartesianImpedanceGains::isotropic(
+        translational_stiffness.value_or(2000.0),
+        rotational_stiffness.value_or(200.0),
+        translational_damping,
+        rotational_damping);
+  }
+  if (damping.has_value()) {
+    const Matrix6d matrix = toCartesianGainMatrix(*damping);
+    validateSymmetricPSD(matrix, "damping");
+    gains.damping = matrix;
+  }
+  return gains;
+}
+
 std::vector<NullspaceTask> toNullspaceTasks(const py::object &object) {
   std::vector<NullspaceTask> tasks;
   if (object.is_none()) return tasks;
@@ -79,8 +141,7 @@ JointImpedanceParams makeJointImpedanceParams(
     const std::optional<Vector7d> &constant_torque_offset, const std::optional<Vector7d> &lower_joint_limits,
     const std::optional<Vector7d> &upper_joint_limits, bool compensate_coriolis, double max_delta_tau,
     double joint_limit_activation_distance, double joint_limit_stiffness, double joint_limit_damping,
-    double joint_limit_max_torque, const std::optional<FrictionCompensationParams> &friction,
-    const std::optional<Vector6d> &cartesian_stiffness, const std::optional<Vector6d> &cartesian_damping) {
+    double joint_limit_max_torque, const std::optional<FrictionCompensationParams> &friction) {
   auto params = JointImpedanceParams{};
   if (stiffness.has_value()) {
     validateNonNegativeFinite(stiffness.value(), "stiffness");
@@ -108,8 +169,9 @@ JointImpedanceParams makeJointImpedanceParams(
 }
 
 CartesianImpedanceBase::Params makeCartesianImpedanceParams(
-    double translational_stiffness, double rotational_stiffness, std::optional<double> translational_damping,
-    std::optional<double> rotational_damping,
+    const std::optional<CartesianGainInput> &stiffness, const std::optional<CartesianGainInput> &damping,
+    std::optional<double> translational_stiffness, std::optional<double> rotational_stiffness,
+    std::optional<double> translational_damping, std::optional<double> rotational_damping,
     const std::optional<std::array<std::optional<double>, 6>> &force_constraints, double max_delta_tau,
     const std::optional<Vector7d> &lower_joint_limits, const std::optional<Vector7d> &upper_joint_limits,
     double joint_limit_activation_distance, double joint_limit_stiffness, double joint_limit_damping,
@@ -117,10 +179,10 @@ CartesianImpedanceBase::Params makeCartesianImpedanceParams(
     const Eigen::Vector3d &rotational_error_clip, const std::vector<NullspaceTask> &nullspace_tasks,
     const std::optional<FrictionCompensationParams> &friction) {
   auto params = CartesianImpedanceBase::Params{};
-  params.translational_stiffness = translational_stiffness;
-  params.rotational_stiffness = rotational_stiffness;
-  params.translational_damping = translational_damping;
-  params.rotational_damping = rotational_damping;
+  const auto gains = resolveCartesianImpedanceGains(
+      stiffness, damping, translational_stiffness, rotational_stiffness, translational_damping, rotational_damping);
+  params.stiffness = gains.stiffness;
+  params.damping = gains.damping;
   params.translational_error_clip = translational_error_clip;
   params.rotational_error_clip = rotational_error_clip;
   params.safety.max_delta_tau = max_delta_tau;
@@ -241,44 +303,83 @@ Only the fields corresponding to configured nullspace task kinds are consumed by
 
   py::class_<CartesianImpedanceGains>(m, "CartesianImpedanceGains")
       .def(
-          py::init<>([](double translational_stiffness,
-                        double rotational_stiffness,
+          py::init<>([](std::optional<CartesianGainInput> stiffness,
+                        std::optional<CartesianGainInput>
+                            damping,
+                        std::optional<double>
+                            translational_stiffness,
+                        std::optional<double>
+                            rotational_stiffness,
                         std::optional<double>
                             translational_damping,
                         std::optional<double>
                             rotational_damping) {
-            return CartesianImpedanceGains{
-                translational_stiffness, rotational_stiffness, translational_damping, rotational_damping};
+            return resolveCartesianImpedanceGains(
+                stiffness,
+                damping,
+                translational_stiffness,
+                rotational_stiffness,
+                translational_damping,
+                rotational_damping);
           }),
-          "translational_stiffness"_a = 2000.0,
-          "rotational_stiffness"_a = 200.0,
+          R"doc(Cartesian impedance gains in the base frame ([x, y, z, rx, ry, rz] order).
+
+Provide either `stiffness` (a symmetric PSD 6x6 matrix, or a 6-vector for per-axis gains with no
+cross-axis coupling) or the legacy `translational_stiffness`/`rotational_stiffness` scalars (which
+build an isotropic block-diagonal matrix), not both. Same for `damping`, which defaults to critical
+damping (2*sqrt(stiffness) generalized via the matrix square root) when omitted.
+
+See also CartesianImpedanceGains.isotropic and CartesianImpedanceGains.diagonal for convenience constructors.)doc",
+          "stiffness"_a = std::nullopt,
+          "damping"_a = std::nullopt,
+          "translational_stiffness"_a = std::nullopt,
+          "rotational_stiffness"_a = std::nullopt,
           "translational_damping"_a = std::nullopt,
           "rotational_damping"_a = std::nullopt)
-      .def_readwrite("translational_stiffness", &CartesianImpedanceGains::translational_stiffness)
-      .def_readwrite("rotational_stiffness", &CartesianImpedanceGains::rotational_stiffness)
-      .def_readwrite("translational_damping", &CartesianImpedanceGains::translational_damping)
-      .def_readwrite("rotational_damping", &CartesianImpedanceGains::rotational_damping);
+      .def_readwrite("stiffness", &CartesianImpedanceGains::stiffness)
+      .def_readwrite("damping", &CartesianImpedanceGains::damping)
+      .def_static(
+          "isotropic",
+          [](double translational_stiffness,
+             double rotational_stiffness,
+             std::optional<double>
+                 translational_damping,
+             std::optional<double>
+                 rotational_damping) {
+            auto gains = CartesianImpedanceGains::isotropic(
+                translational_stiffness, rotational_stiffness, translational_damping, rotational_damping);
+            validateSymmetricPSD(gains.stiffness, "stiffness");
+            if (gains.damping.has_value()) validateSymmetricPSD(*gains.damping, "damping");
+            return gains;
+          },
+          "Convenience constructor for independent translational/rotational stiffness with no axis coupling.",
+          "translational_stiffness"_a,
+          "rotational_stiffness"_a,
+          "translational_damping"_a = std::nullopt,
+          "rotational_damping"_a = std::nullopt)
+      .def_static(
+          "diagonal",
+          [](const Vector6d &stiffness, std::optional<Vector6d> damping) {
+            auto gains = CartesianImpedanceGains::diagonal(stiffness, damping);
+            validateSymmetricPSD(gains.stiffness, "stiffness");
+            if (gains.damping.has_value()) validateSymmetricPSD(*gains.damping, "damping");
+            return gains;
+          },
+          "Convenience constructor for per-axis (x, y, z, rx, ry, rz) stiffness with no cross-axis coupling.",
+          "stiffness"_a,
+          "damping"_a = std::nullopt);
 
   py::class_<CartesianImpedanceGainsHandle, std::shared_ptr<CartesianImpedanceGainsHandle>>(
       m, "CartesianImpedanceGainsHandle")
       .def(py::init<>())
       .def(
           "set",
-          [](CartesianImpedanceGainsHandle &handle,
-             double translational_stiffness,
-             double rotational_stiffness,
-             std::optional<double>
-                 translational_damping,
-             std::optional<double>
-                 rotational_damping) {
-            handle.set(
-                CartesianImpedanceGains{
-                    translational_stiffness, rotational_stiffness, translational_damping, rotational_damping});
+          [](CartesianImpedanceGainsHandle &handle, const CartesianImpedanceGains &gains) {
+            validateSymmetricPSD(gains.stiffness, "stiffness");
+            if (gains.damping.has_value()) validateSymmetricPSD(*gains.damping, "damping");
+            handle.set(gains);
           },
-          "translational_stiffness"_a,
-          "rotational_stiffness"_a,
-          "translational_damping"_a = std::nullopt,
-          "rotational_damping"_a = std::nullopt)
+          "gains"_a)
       .def("clear", &CartesianImpedanceGainsHandle::clear)
       .def("get", &CartesianImpedanceGainsHandle::get)
       .def_property_readonly("has_gains", &CartesianImpedanceGainsHandle::hasGains);
@@ -398,14 +499,12 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
       .def_readwrite("constant_torque_offset", &JointImpedanceParams::constant_torque_offset)
       .def_readwrite("compensate_coriolis", &JointImpedanceParams::compensate_coriolis)
       .def_readwrite("safety", &JointImpedanceParams::safety)
-      .def_readwrite("friction", &JointImpedanceParams::friction)
+      .def_readwrite("friction", &JointImpedanceParams::friction);
 
   py::class_<CartesianImpedanceBase::Params>(m, "CartesianImpedanceParams")
       .def(py::init<>())
-      .def_readwrite("translational_stiffness", &CartesianImpedanceBase::Params::translational_stiffness)
-      .def_readwrite("rotational_stiffness", &CartesianImpedanceBase::Params::rotational_stiffness)
-      .def_readwrite("translational_damping", &CartesianImpedanceBase::Params::translational_damping)
-      .def_readwrite("rotational_damping", &CartesianImpedanceBase::Params::rotational_damping)
+      .def_readwrite("stiffness", &CartesianImpedanceBase::Params::stiffness)
+      .def_readwrite("damping", &CartesianImpedanceBase::Params::damping)
       .def_readwrite("translational_error_clip", &CartesianImpedanceBase::Params::translational_error_clip)
       .def_readwrite("rotational_error_clip", &CartesianImpedanceBase::Params::rotational_error_clip)
       .def_readwrite("force_constraints", &CartesianImpedanceBase::Params::force_constraints)
@@ -448,7 +547,7 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_damping,
                         double joint_limit_max_torque,
                         std::optional<FrictionCompensationParams>
-                            friction,
+                            friction) {
             auto params = makeJointImpedanceParams(
                 stiffness,
                 damping,
@@ -461,9 +560,7 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
-                friction,
-                cartesian_stiffness,
-                cartesian_damping);
+                friction);
 
             const Vector7d target_vector = target;
             if (target_velocity.has_value()) {
@@ -484,7 +581,7 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
           "joint_limit_stiffness"_a = 4.0,
           "joint_limit_damping"_a = 1.0,
           "joint_limit_max_torque"_a = 5.0,
-          "friction"_a = std::nullopt,
+          "friction"_a = std::nullopt)
       .def_property_readonly("target", &JointImpedanceMotion::target)
       .def_property_readonly("target_velocity", &JointImpedanceMotion::target_velocity)
       .def_property_readonly("params", [](const JointImpedanceMotion &m) { return m.params(); });
@@ -511,10 +608,6 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                         double joint_limit_max_torque,
                         std::optional<FrictionCompensationParams>
                             friction,
-                        std::optional<Vector6d>
-                            cartesian_stiffness,
-                        std::optional<Vector6d>
-                            cartesian_damping,
                         std::shared_ptr<JointImpedanceGainsHandle>
                             gains_handle,
                         double gains_time_constant) {
@@ -530,10 +623,10 @@ If target_acceleration is provided, it is interpreted as the desired end-effecto
                 joint_limit_stiffness,
                 joint_limit_damping,
                 joint_limit_max_torque,
+                friction);
             if (gains_handle) {
               return std::make_shared<JointImpedanceTrackingMotion>(
                   reference_handle, params, gains_handle, gains_time_constant);
-                friction,
             }
             return std::make_shared<JointImpedanceTrackingMotion>(reference_handle, params);
           }),
@@ -567,8 +660,14 @@ interpolates toward them with the given time constant, allowing smooth runtime s
       .def(
           py::init<>([](const Affine &target,
                         ReferenceType target_type,
-                        double translational_stiffness,
-                        double rotational_stiffness,
+                        std::optional<CartesianGainInput>
+                            stiffness,
+                        std::optional<CartesianGainInput>
+                            damping,
+                        std::optional<double>
+                            translational_stiffness,
+                        std::optional<double>
+                            rotational_stiffness,
                         std::optional<double>
                             translational_damping,
                         std::optional<double>
@@ -591,6 +690,8 @@ interpolates toward them with the given time constant, allowing smooth runtime s
                         std::optional<FrictionCompensationParams>
                             friction) {
             auto base_params = makeCartesianImpedanceParams(
+                stiffness,
+                damping,
                 translational_stiffness,
                 rotational_stiffness,
                 translational_damping,
@@ -615,11 +716,16 @@ interpolates toward them with the given time constant, allowing smooth runtime s
           }),
           R"doc(Construct an exponential Cartesian impedance motion toward a fixed target pose.
 
-Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly to override.)doc",
+Provide either `stiffness` (a 6x6 matrix or 6-vector, base frame, [x, y, z, rx, ry, rz] order) or the
+`translational_stiffness`/`rotational_stiffness` scalars (isotropic, no axis coupling), not both.
+Damping defaults to None (critical damping, generalizing 2*sqrt(stiffness) via the matrix square root).
+Set explicitly to override.)doc",
           "target"_a,
           py::arg_v("target_type", ReferenceType::kAbsolute, "_franky.ReferenceType.Absolute"),
-          "translational_stiffness"_a = 2000,
-          "rotational_stiffness"_a = 200,
+          "stiffness"_a = std::nullopt,
+          "damping"_a = std::nullopt,
+          "translational_stiffness"_a = std::nullopt,
+          "rotational_stiffness"_a = std::nullopt,
           "translational_damping"_a = std::nullopt,
           "rotational_damping"_a = std::nullopt,
           "force_constraints"_a = std::nullopt,
@@ -644,8 +750,14 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
           py::init<>([](const Affine &target,
                         franka::Duration duration,
                         ReferenceType target_type,
-                        double translational_stiffness,
-                        double rotational_stiffness,
+                        std::optional<CartesianGainInput>
+                            stiffness,
+                        std::optional<CartesianGainInput>
+                            damping,
+                        std::optional<double>
+                            translational_stiffness,
+                        std::optional<double>
+                            rotational_stiffness,
                         std::optional<double>
                             translational_damping,
                         std::optional<double>
@@ -669,6 +781,8 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
                         std::optional<FrictionCompensationParams>
                             friction) {
             auto base_params = makeCartesianImpedanceParams(
+                stiffness,
+                damping,
                 translational_stiffness,
                 rotational_stiffness,
                 translational_damping,
@@ -694,12 +808,17 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
           }),
           R"doc(Construct a Cartesian impedance motion that interpolates to a fixed target pose over the given duration.
 
-Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly to override.)doc",
+Provide either `stiffness` (a 6x6 matrix or 6-vector, base frame, [x, y, z, rx, ry, rz] order) or the
+`translational_stiffness`/`rotational_stiffness` scalars (isotropic, no axis coupling), not both.
+Damping defaults to None (critical damping, generalizing 2*sqrt(stiffness) via the matrix square root).
+Set explicitly to override.)doc",
           "target"_a,
           "duration"_a,
           py::arg_v("target_type", ReferenceType::kAbsolute, "_franky.ReferenceType.Absolute"),
-          "translational_stiffness"_a = 2000,
-          "rotational_stiffness"_a = 200,
+          "stiffness"_a = std::nullopt,
+          "damping"_a = std::nullopt,
+          "translational_stiffness"_a = std::nullopt,
+          "rotational_stiffness"_a = std::nullopt,
           "translational_damping"_a = std::nullopt,
           "rotational_damping"_a = std::nullopt,
           "force_constraints"_a = std::nullopt,
@@ -726,8 +845,14 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
       std::shared_ptr<CartesianImpedanceTrackingMotion>>(m, "CartesianImpedanceTrackingMotion")
       .def(
           py::init<>([](const std::shared_ptr<CartesianReferenceHandle> &reference_handle,
-                        double translational_stiffness,
-                        double rotational_stiffness,
+                        std::optional<CartesianGainInput>
+                            stiffness,
+                        std::optional<CartesianGainInput>
+                            damping,
+                        std::optional<double>
+                            translational_stiffness,
+                        std::optional<double>
+                            rotational_stiffness,
                         std::optional<double>
                             translational_damping,
                         std::optional<double>
@@ -755,6 +880,8 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
                         std::shared_ptr<NullspaceGainsHandle>
                             nullspace_gains_handle) {
             auto base_params = makeCartesianImpedanceParams(
+                stiffness,
+                damping,
                 translational_stiffness,
                 rotational_stiffness,
                 translational_damping,
@@ -785,13 +912,20 @@ Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly t
           R"doc(Construct a dynamic Cartesian impedance tracking controller driven by a CartesianReferenceHandle.
 
 Each published Cartesian reference may optionally include a desired end-effector twist in the base frame.
-Damping defaults to None (critical damping, 2*sqrt(stiffness)). Set explicitly to override.
+Provide either `stiffness` (a 6x6 matrix or 6-vector, base frame, [x, y, z, rx, ry, rz] order) or the
+`translational_stiffness`/`rotational_stiffness` scalars (isotropic, no axis coupling), not both.
+Damping defaults to None (critical damping, generalizing 2*sqrt(stiffness) via the matrix square root).
+Set explicitly to override.
 
 If gains_handle is provided, the controller reads target gains from it each cycle and exponentially
-interpolates toward them with the given time constant, allowing smooth runtime stiffness changes.)doc",
+interpolates toward them with the given time constant, allowing smooth runtime stiffness changes. Gains
+read from gains_handle are always full CartesianImpedanceGains matrices (see CartesianImpedanceGains.isotropic
+and .diagonal for convenience constructors), independent of how the initial gains above were specified.)doc",
           "reference_handle"_a,
-          "translational_stiffness"_a = 2000,
-          "rotational_stiffness"_a = 200,
+          "stiffness"_a = std::nullopt,
+          "damping"_a = std::nullopt,
+          "translational_stiffness"_a = std::nullopt,
+          "rotational_stiffness"_a = std::nullopt,
           "translational_damping"_a = std::nullopt,
           "rotational_damping"_a = std::nullopt,
           py::arg_v(

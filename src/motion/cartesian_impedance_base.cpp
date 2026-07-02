@@ -63,12 +63,18 @@ NullspaceGains nullspaceGainsFromTasks(const std::vector<NullspaceTask> &tasks) 
   return gains;
 }
 
-double lerp(double current, double target, double alpha) { return current + alpha * (target - current); }
+template <typename T>
+T lerp(const T &current, const T &target, double alpha) {
+  return current + alpha * (target - current);
+}
 
-std::optional<double> lerpOptionalDamping(
-    std::optional<double> current, std::optional<double> target, double default_current, double alpha) {
+// default_current is only invoked when actually needed (target set, current unset) since it may be
+// expensive (e.g. a matrix eigendecomposition) and this runs on the RT control path.
+template <typename T, typename DefaultFn>
+std::optional<T> lerpOptionalDamping(
+    const std::optional<T> &current, const std::optional<T> &target, DefaultFn &&default_current, double alpha) {
   if (!target.has_value()) return std::nullopt;
-  return lerp(current.value_or(default_current), *target, alpha);
+  return lerp(current.has_value() ? *current : default_current(), *target, alpha);
 }
 }  // namespace
 
@@ -223,10 +229,8 @@ CartesianImpedanceBase::CartesianImpedanceBase(
       gains_handle_(std::move(runtime.gains_handle)),
       nullspace_gains_handle_(std::move(runtime.nullspace_gains_handle)),
       gains_time_constant_(runtime.gains_time_constant),
-      current_translational_stiffness_(params.translational_stiffness),
-      current_rotational_stiffness_(params.rotational_stiffness),
-      current_translational_damping_(params.translational_damping),
-      current_rotational_damping_(params.rotational_damping),
+      current_stiffness_(params.stiffness),
+      current_damping_(params.damping),
       Motion<franka::Torques>() {
   if (nullspace_gains_handle_) rejectDuplicateRuntimeNullspaceTasks(params_.nullspace_tasks);
   current_nullspace_gains_ = nullspaceGainsFromTasks(params.nullspace_tasks);
@@ -234,16 +238,8 @@ CartesianImpedanceBase::CartesianImpedanceBase(
 }
 
 void CartesianImpedanceBase::rebuildStiffnessDamping() {
-  stiffness.setZero();
-  stiffness.topLeftCorner(3, 3) << current_translational_stiffness_ * Eigen::MatrixXd::Identity(3, 3);
-  stiffness.bottomRightCorner(3, 3) << current_rotational_stiffness_ * Eigen::MatrixXd::Identity(3, 3);
-  damping.setZero();
-  const double translational_damping =
-      current_translational_damping_.value_or(2.0 * std::sqrt(current_translational_stiffness_));
-  const double rotational_damping =
-      current_rotational_damping_.value_or(2.0 * std::sqrt(current_rotational_stiffness_));
-  damping.topLeftCorner(3, 3) << translational_damping * Eigen::MatrixXd::Identity(3, 3);
-  damping.bottomRightCorner(3, 3) << rotational_damping * Eigen::MatrixXd::Identity(3, 3);
+  stiffness = current_stiffness_;
+  damping = current_damping_.has_value() ? *current_damping_ : defaultCartesianImpedanceDamping(current_stiffness_);
 }
 
 void CartesianImpedanceBase::initImpl(
@@ -264,18 +260,11 @@ franka::Torques CartesianImpedanceBase::nextCommandImpl(
 
   if (gains_handle_ && gains_handle_->hasGains()) {
     const auto target_gains = gains_handle_->get();
-    current_translational_stiffness_ =
-        lerp(current_translational_stiffness_, target_gains.translational_stiffness, alpha);
-    current_rotational_stiffness_ = lerp(current_rotational_stiffness_, target_gains.rotational_stiffness, alpha);
-    current_translational_damping_ = lerpOptionalDamping(
-        current_translational_damping_,
-        target_gains.translational_damping,
-        2.0 * std::sqrt(current_translational_stiffness_),
-        alpha);
-    current_rotational_damping_ = lerpOptionalDamping(
-        current_rotational_damping_,
-        target_gains.rotational_damping,
-        2.0 * std::sqrt(current_rotational_stiffness_),
+    current_stiffness_ = lerp(current_stiffness_, target_gains.stiffness, alpha);
+    current_damping_ = lerpOptionalDamping(
+        current_damping_,
+        target_gains.damping,
+        [&] { return defaultCartesianImpedanceDamping(current_stiffness_); },
         alpha);
     rebuildStiffnessDamping();
   }
@@ -285,8 +274,8 @@ franka::Torques CartesianImpedanceBase::nextCommandImpl(
     auto &cur = current_nullspace_gains_;
     cur.posture_stiffness = lerp(cur.posture_stiffness, target.posture_stiffness, alpha);
     cur.posture_max_torque = lerp(cur.posture_max_torque, target.posture_max_torque, alpha);
-    cur.posture_damping =
-        lerpOptionalDamping(cur.posture_damping, target.posture_damping, 2.0 * std::sqrt(cur.posture_stiffness), alpha);
+    cur.posture_damping = lerpOptionalDamping(
+        cur.posture_damping, target.posture_damping, [&] { return 2.0 * std::sqrt(cur.posture_stiffness); }, alpha);
     cur.manipulability_gain = lerp(cur.manipulability_gain, target.manipulability_gain, alpha);
     cur.manipulability_damping = lerp(cur.manipulability_damping, target.manipulability_damping, alpha);
     cur.manipulability_max_torque = lerp(cur.manipulability_max_torque, target.manipulability_max_torque, alpha);

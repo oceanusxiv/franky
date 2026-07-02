@@ -156,25 +156,28 @@ enum class CartesianImpedanceDynamicsMode {
  */
 class CartesianImpedanceBase : public Motion<franka::Torques> {
  public:
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
   /**
    * @brief Parameters for the impedance motion.
    */
   struct Params {
-    /** The translational stiffness in N/m. */
-    double translational_stiffness{2000};
-
-    /** The rotational stiffness in Nm/rad. */
-    double rotational_stiffness{200};
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
     /**
-     * Translational damping [N·s/m]. nullopt → critical damping (2*sqrt(stiffness)).
+     * Cartesian stiffness matrix [N/m, Nm/rad], expressed in the base frame with axis order
+     * [x, y, z, rx, ry, rz] matching Model::zeroJacobian. Must be symmetric and positive
+     * semi-definite. Defaults to the isotropic block-diagonal matrix corresponding to the
+     * previous translational_stiffness=2000/rotational_stiffness=200 defaults; see
+     * CartesianImpedanceGains::isotropic and CartesianImpedanceGains::diagonal for convenience
+     * constructors covering the common non-coupled cases.
      */
-    std::optional<double> translational_damping{std::nullopt};
+    Matrix6d stiffness{defaultCartesianImpedanceStiffness()};
 
     /**
-     * Rotational damping [N·m·s/rad]. nullopt → critical damping (2*sqrt(stiffness)).
+     * Cartesian damping matrix. nullopt → critical damping, see defaultCartesianImpedanceDamping.
      */
-    std::optional<double> rotational_damping{std::nullopt};
+    std::optional<Matrix6d> damping{std::nullopt};
 
     /**
      * Maximum absolute Cartesian position error [m] used by the task-space controller.
@@ -268,13 +271,11 @@ class CartesianImpedanceBase : public Motion<franka::Torques> {
   std::shared_ptr<CartesianImpedanceGainsHandle> gains_handle_;
   std::shared_ptr<NullspaceGainsHandle> nullspace_gains_handle_;
   double gains_time_constant_;
-  double current_translational_stiffness_;
-  double current_rotational_stiffness_;
-  std::optional<double> current_translational_damping_;
-  std::optional<double> current_rotational_damping_;
+  Matrix6d current_stiffness_;
+  std::optional<Matrix6d> current_damping_;
   NullspaceGains current_nullspace_gains_;
 
-  Eigen::Matrix<double, 6, 6> stiffness, damping;
+  Matrix6d stiffness, damping;
   Affine intermediate_target_;
 
   std::unique_ptr<franka::Model> model_;
